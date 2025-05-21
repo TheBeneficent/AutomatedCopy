@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.11.35303.130
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AutomatedCopy", "AutomatedCopy\AutomatedCopy.csproj", "{AD659753-91B7-4B39-8E48-64AA4116887C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{AD659753-91B7-4B39-8E48-64AA4116887C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AD659753-91B7-4B39-8E48-64AA4116887C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AD659753-91B7-4B39-8E48-64AA4116887C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AD659753-91B7-4B39-8E48-64AA4116887C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D3964A65-8C2D-4330-8134-6B1A416E7117}
+	EndGlobalSection
+EndGlobal
