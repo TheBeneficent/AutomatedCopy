@@ -3,7 +3,9 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using LicenseContext = OfficeOpenXml.LicenseContext;
@@ -15,6 +17,8 @@ namespace AutomatedCopy
         private TextBox txtExcelPath;
         private Button btnBrowse;
         private Button btnCopyFiles;
+        private Button btnPauseResume;
+        private Button btnStop;
         private RadioButton rbtnCopy;
         private RadioButton rbtnMove;
         private Label overalProgressbarLabel;
@@ -22,23 +26,38 @@ namespace AutomatedCopy
         private Label currentProgressbarLabel;
         private ProgressBar progressBarCurrent;
         private RichTextBox rtbLogs;
+        private TreeView tvSourceTree;
+        private Label lblFileCount;
+        private Label lblFolderCount;
+        private Label lblTotalSize;
         private bool isMoveOperation = false;
+        private bool isPaused = false;
+        private bool isStopped = false;
+        private CancellationTokenSource cancellationTokenSource;
 
         private List<string> successfulFiles = new List<string>();
         private List<string> failedFiles = new List<string>();
+        private long totalSizeBytes = 0;
+        private long processedSizeBytes = 0;
+        private int totalFiles = 0;
+        private int processedFiles = 0;
+
+        private bool overwriteAll = false;
+        private bool skipAll = false;
 
         public Form1()
         {
-            this.Text = "Automated Copy";
+            InitializeComponent();
+            this.Text = "Automated Copy V4.0";
             this.Name = "Automated Copy";
             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
-            InitializeComponent();
+            
             InitializeControls();
         }
 
         private void InitializeControls()
         {
-            this.Size = new Size(600, 550);
+            this.Size = new Size(900, 700);
 
             txtExcelPath = new TextBox
             {
@@ -65,9 +84,29 @@ namespace AutomatedCopy
             btnCopyFiles.Click += BtnCopyFiles_Click;
             this.Controls.Add(btnCopyFiles);
 
-            rbtnCopy = new RadioButton
+            btnPauseResume = new Button
             {
                 Location = new Point(120, 40),
+                Size = new Size(100, 23),
+                Text = "Pause",
+                Enabled = false
+            };
+            btnPauseResume.Click += BtnPauseResume_Click;
+            this.Controls.Add(btnPauseResume);
+
+            btnStop = new Button
+            {
+                Location = new Point(230, 40),
+                Size = new Size(100, 23),
+                Text = "Stop",
+                Enabled = false
+            };
+            btnStop.Click += BtnStop_Click;
+            this.Controls.Add(btnStop);
+
+            rbtnCopy = new RadioButton
+            {
+                Location = new Point(340, 40),
                 Size = new Size(80, 23),
                 Text = "Copy",
                 Checked = true
@@ -77,7 +116,7 @@ namespace AutomatedCopy
 
             rbtnMove = new RadioButton
             {
-                Location = new Point(200, 40),
+                Location = new Point(420, 40),
                 Size = new Size(80, 23),
                 Text = "Move"
             };
@@ -87,8 +126,8 @@ namespace AutomatedCopy
             overalProgressbarLabel = new Label
             {
                 Location = new Point(10, 80),
-                Size = new Size(150, 23),
-                Text = "Overall Progress"
+                Size = new Size(300, 23),
+                Text = "Overall Progress: 0% (0/0 files remaining)"
             };
             this.Controls.Add(overalProgressbarLabel);
 
@@ -102,8 +141,8 @@ namespace AutomatedCopy
             currentProgressbarLabel = new Label
             {
                 Location = new Point(10, 150),
-                Size = new Size(150, 23),
-                Text = "Current File Progress"
+                Size = new Size(300, 23),
+                Text = "Current File Progress: 0%"
             };
             this.Controls.Add(currentProgressbarLabel);
 
@@ -114,17 +153,50 @@ namespace AutomatedCopy
             };
             this.Controls.Add(progressBarCurrent);
 
+            // Tree view for source files
+            tvSourceTree = new TreeView
+            {
+                Location = new Point(580, 10),
+                Size = new Size(300, 200),
+                CheckBoxes = false
+            };
+            this.Controls.Add(tvSourceTree);
+
+            // Labels for statistics
+            lblFileCount = new Label
+            {
+                Location = new Point(580, 220),
+                Size = new Size(300, 20),
+                Text = "Total Files: 0"
+            };
+            this.Controls.Add(lblFileCount);
+
+            lblFolderCount = new Label
+            {
+                Location = new Point(580, 240),
+                Size = new Size(300, 20),
+                Text = "Total Folders: 0"
+            };
+            this.Controls.Add(lblFolderCount);
+
+            lblTotalSize = new Label
+            {
+                Location = new Point(580, 260),
+                Size = new Size(300, 40),
+                Text = "Total Size: 0 bytes (0 B)"
+            };
+            this.Controls.Add(lblTotalSize);
+
             rtbLogs = new RichTextBox
             {
                 Location = new Point(10, 210),
-                Size = new Size(560, 280),
+                Size = new Size(870, 440),
                 ReadOnly = true,
                 Font = new Font("Arial", 10, FontStyle.Bold),
                 WordWrap = true
             };
             this.Controls.Add(rtbLogs);
         }
-
 
         private void BtnBrowse_Click(object sender, EventArgs e)
         {
@@ -136,8 +208,93 @@ namespace AutomatedCopy
                 if (openFileDialog.ShowDialog() == DialogResult.OK)
                 {
                     txtExcelPath.Text = openFileDialog.FileName;
+                    LoadSourceTree(openFileDialog.FileName);
                 }
             }
+        }
+
+        private void LoadSourceTree(string excelFilePath)
+        {
+            try
+            {
+                tvSourceTree.Nodes.Clear();
+                totalSizeBytes = 0;
+                totalFiles = 0;
+                int folderCount = 0;
+
+                using (var package = new ExcelPackage(new FileInfo(excelFilePath)))
+                {
+                    var worksheet = package.Workbook.Worksheets[0];
+                    int rowCount = worksheet.Dimension.Rows;
+
+                    for (int row = 2; row <= rowCount; row++)
+                    {
+                        string sourcePath = worksheet.Cells[row, 1].Text.Trim();
+
+                        if (string.IsNullOrEmpty(sourcePath) || !Directory.Exists(sourcePath))
+                            continue;
+
+                        var rootNode = new TreeNode(sourcePath);
+                        folderCount++;
+                        ProcessDirectoryForTree(sourcePath, rootNode, ref folderCount);
+                        tvSourceTree.Nodes.Add(rootNode);
+                    }
+                }
+
+                lblFileCount.Text = $"Total Files: {totalFiles:N0}";
+                lblFolderCount.Text = $"Total Folders: {folderCount:N0}";
+                lblTotalSize.Text = $"Total Size: {totalSizeBytes:N0} bytes ({FormatSize(totalSizeBytes)})";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error loading source tree: {ex.Message}");
+            }
+        }
+
+        private void ProcessDirectoryForTree(string path, TreeNode parentNode, ref int folderCount)
+        {
+            try
+            {
+                // Add files
+                foreach (string file in Directory.GetFiles(path))
+                {
+                    var fileNode = new TreeNode(Path.GetFileName(file));
+                    parentNode.Nodes.Add(fileNode);
+
+                    try
+                    {
+                        var fileInfo = new FileInfo(file);
+                        totalSizeBytes += fileInfo.Length;
+                        totalFiles++;
+                    }
+                    catch { }
+                }
+
+                // Add subdirectories
+                foreach (string directory in Directory.GetDirectories(path))
+                {
+                    var dirNode = new TreeNode(Path.GetFileName(directory));
+                    parentNode.Nodes.Add(dirNode);
+                    folderCount++;
+                    ProcessDirectoryForTree(directory, dirNode, ref folderCount);
+                }
+            }
+            catch { }
+        }
+
+        private string FormatSize(long bytes)
+        {
+            string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+            int order = 0;
+            double size = bytes;
+
+            while (size >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                size /= 1024;
+            }
+
+            return $"{size:0.##} {sizes[order]}";
         }
 
         private async void BtnCopyFiles_Click(object sender, EventArgs e)
@@ -151,28 +308,70 @@ namespace AutomatedCopy
             }
 
             btnCopyFiles.Enabled = false;
+            btnBrowse.Enabled = false;
+            btnPauseResume.Enabled = true;
+            btnStop.Enabled = true;
             progressBarOverall.Value = 0;
             progressBarCurrent.Value = 0;
             rtbLogs.Clear();
             successfulFiles.Clear();
             failedFiles.Clear();
+            processedSizeBytes = 0;
+            processedFiles = 0;
+            isPaused = false;
+            isStopped = false;
+            overwriteAll = false;
+            skipAll = false;
+            cancellationTokenSource = new CancellationTokenSource();
 
             try
             {
-                await Task.Run(() => ProcessExcelFile(excelFilePath));
-                MessageBox.Show(isMoveOperation ? "Files moved successfully!" : "Files copied successfully!");
+                await Task.Run(() => ProcessExcelFile(excelFilePath, cancellationTokenSource.Token));
+                if (!isStopped)
+                {
+                    MessageBox.Show(isMoveOperation ? "Files moved successfully!" : "Files copied successfully!");
+                }
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"An error occurred: {ex.Message}");
+                if (!isStopped)
+                {
+                    MessageBox.Show($"An error occurred: {ex.Message}");
+                }
             }
             finally
             {
                 btnCopyFiles.Enabled = true;
+                btnBrowse.Enabled = true;
+                btnPauseResume.Enabled = false;
+                btnStop.Enabled = false;
             }
         }
 
-        private void ProcessExcelFile(string excelFilePath)
+        private void BtnPauseResume_Click(object sender, EventArgs e)
+        {
+            isPaused = !isPaused;
+            btnPauseResume.Text = isPaused ? "Resume" : "Pause";
+
+            if (isPaused)
+            {
+                LogMessage("Operation paused");
+            }
+            else
+            {
+                LogMessage("Operation resumed");
+            }
+        }
+
+        private void BtnStop_Click(object sender, EventArgs e)
+        {
+            isStopped = true;
+            cancellationTokenSource?.Cancel();
+            btnPauseResume.Enabled = false;
+            LogMessage("Operation stopped by user");
+        }
+
+        private void ProcessExcelFile(string excelFilePath, CancellationToken cancellationToken)
         {
             using (var package = new ExcelPackage(new FileInfo(excelFilePath)))
             {
@@ -181,6 +380,17 @@ namespace AutomatedCopy
 
                 for (int row = 2; row <= rowCount; row++)
                 {
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+
+                    while (isPaused && !cancellationToken.IsCancellationRequested)
+                    {
+                        Thread.Sleep(500);
+                    }
+
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+
                     string sourcePath = worksheet.Cells[row, 1].Text.Trim();
                     string targetPath = worksheet.Cells[row, 2].Text.Trim();
 
@@ -192,17 +402,20 @@ namespace AutomatedCopy
 
                     LogMessage($"Processing Row {row}: Source='{sourcePath}', Target='{targetPath}'");
 
-                    CopyOrMoveDirectory(sourcePath, targetPath);
+                    CopyOrMoveDirectory(sourcePath, targetPath, cancellationToken);
 
-                    UpdateOverallProgress((row - 1) * 100 / (rowCount - 1));
+                    UpdateOverallProgress((row - 1) * 100 / (rowCount - 1), rowCount - row);
                 }
             }
 
-            LogSummary();
-            SaveLogToFile(); 
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                LogSummary();
+                SaveLogToExcel();
+            }
         }
 
-        private void CopyOrMoveDirectory(string sourceDir, string targetDir)
+        private void CopyOrMoveDirectory(string sourceDir, string targetDir, CancellationToken cancellationToken)
         {
             if (!Directory.Exists(sourceDir))
             {
@@ -215,31 +428,74 @@ namespace AutomatedCopy
             var files = Directory.GetFiles(sourceDir);
             for (int i = 0; i < files.Length; i++)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                while (isPaused && !cancellationToken.IsCancellationRequested)
+                {
+                    Thread.Sleep(500);
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
                 string file = files[i];
                 string fileName = Path.GetFileName(file);
                 string destFile = Path.Combine(targetDir, fileName);
 
-
                 try
                 {
-                    if (!File.Exists(destFile))
+                    var fileInfo = new FileInfo(file);
+                    long fileSize = fileInfo.Length;
+
+                    if (File.Exists(destFile) && !overwriteAll && !skipAll)
                     {
-                        if (isMoveOperation)
+                        var result = ShowFileConflictDialog(fileName);
+                        if (result == DialogResult.No) // Skip
                         {
-                            File.Move(file, destFile);
-                            LogMessage($"Moved: {fileName} to {targetDir}");
+                            LogMessage($"Skipped: {fileName} (user chose to skip)");
+                            continue;
                         }
-                        else
+                        else if (result == DialogResult.Yes) // Overwrite
                         {
-                            File.Copy(file, destFile);
-                            LogMessage($"Copied: {fileName} to {targetDir}");
+                            // Continue to overwrite
                         }
-                        successfulFiles.Add(destFile);
+                        else if (result == DialogResult.Ignore) // Skip all
+                        {
+                            skipAll = true;
+                            LogMessage($"Skipped: {fileName} (user chose to skip all)");
+                            continue;
+                        }
+                        else if (result == DialogResult.Retry) // Overwrite all
+                        {
+                            overwriteAll = true;
+                            // Continue to overwrite
+                        }
+                    }
+
+                    if (File.Exists(destFile) && skipAll)
+                    {
+                        LogMessage($"Skipped: {fileName} (skip all active)");
+                        continue;
+                    }
+
+                    if (isMoveOperation)
+                    {
+                        if (File.Exists(destFile)) File.Delete(destFile);
+                        File.Move(file, destFile);
+                        LogMessage($"Moved: {fileName} to {targetDir}");
                     }
                     else
                     {
-                        LogMessage($"Skipped: {fileName} (already exists in target)");
+                        if (File.Exists(destFile) && !overwriteAll) continue;
+                        if (File.Exists(destFile)) File.Delete(destFile);
+                        File.Copy(file, destFile);
+                        LogMessage($"Copied: {fileName} to {targetDir}");
                     }
+
+                    successfulFiles.Add(destFile);
+                    processedSizeBytes += fileSize;
+                    processedFiles++;
                 }
                 catch (Exception ex)
                 {
@@ -252,21 +508,89 @@ namespace AutomatedCopy
 
             foreach (string subDir in Directory.GetDirectories(sourceDir))
             {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
                 string destSubDir = Path.Combine(targetDir, Path.GetFileName(subDir));
-                CopyOrMoveDirectory(subDir, destSubDir);
+                CopyOrMoveDirectory(subDir, destSubDir, cancellationToken);
             }
 
             if (isMoveOperation && Directory.Exists(sourceDir) && Directory.GetFileSystemEntries(sourceDir).Length == 0)
             {
-                Directory.Delete(sourceDir);
+                try
+                {
+                    Directory.Delete(sourceDir);
+                }
+                catch { }
+            }
+        }
+
+        private DialogResult ShowFileConflictDialog(string fileName)
+        {
+            if (this.InvokeRequired)
+            {
+                return (DialogResult)this.Invoke(new Func<DialogResult>(() => ShowFileConflictDialog(fileName)));
+            }
+
+            using (var form = new Form())
+            {
+                form.Text = "File Conflict";
+                form.Size = new Size(400, 200);
+                form.FormBorderStyle = FormBorderStyle.FixedDialog;
+                form.StartPosition = FormStartPosition.CenterParent;
+
+                var label = new Label
+                {
+                    Text = $"The file '{fileName}' already exists. What would you like to do?",
+                    Dock = DockStyle.Top,
+                    Padding = new Padding(10),
+                    AutoSize = true
+                };
+
+                var btnOverwrite = new Button { Text = "Overwrite", DialogResult = DialogResult.Yes };
+                var btnOverwriteAll = new Button { Text = "Overwrite All", DialogResult = DialogResult.Retry };
+                var btnSkip = new Button { Text = "Skip", DialogResult = DialogResult.No };
+                var btnSkipAll = new Button { Text = "Skip All", DialogResult = DialogResult.Ignore };
+
+                btnOverwrite.Click += (s, e) => form.Close();
+                btnOverwriteAll.Click += (s, e) => form.Close();
+                btnSkip.Click += (s, e) => form.Close();
+                btnSkipAll.Click += (s, e) => form.Close();
+
+                var flowLayout = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Padding = new Padding(10),
+                    AutoSize = true
+                };
+
+                flowLayout.Controls.Add(btnOverwriteAll);
+                flowLayout.Controls.Add(btnOverwrite);
+                flowLayout.Controls.Add(btnSkipAll);
+                flowLayout.Controls.Add(btnSkip);
+
+                form.Controls.Add(label);
+                form.Controls.Add(flowLayout);
+
+                return form.ShowDialog(this);
             }
         }
 
         private void LogSummary()
         {
+            long successfulSize = successfulFiles.Sum(f => {
+                try { return new FileInfo(f).Length; } catch { return 0; }
+            });
+            long failedSize = failedFiles.Sum(f => {
+                try { return new FileInfo(f).Length; } catch { return 0; }
+            });
+
             LogMessage("\n=== Summary ===");
-            LogMessage($"Total Successful Files: {successfulFiles.Count}");
-            LogMessage($"Total Failed Files: {failedFiles.Count}");
+            LogMessage($"Total Successful Files: {successfulFiles.Count:N0}");
+            LogMessage($"Total Successful Size: {FormatSize(successfulSize)}");
+            LogMessage($"Total Failed Files: {failedFiles.Count:N0}");
+            LogMessage($"Total Failed Size: {FormatSize(failedSize)}");
 
             LogMessage("\nSuccessful Files:");
             foreach (var file in successfulFiles)
@@ -284,29 +608,102 @@ namespace AutomatedCopy
             }
         }
 
-        private void SaveLogToFile()
+        private void SaveLogToExcel()
         {
-            string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LogFile.txt");
-            using (StreamWriter writer = new StreamWriter(logPath, false, Encoding.UTF8))
+            string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"CopyLog_{DateTime.Now:yyyyMMddHHmmss}.xlsx");
+
+            using (var package = new ExcelPackage())
             {
-                writer.Write(rtbLogs.Text);
+                // Summary sheet
+                var summarySheet = package.Workbook.Worksheets.Add("Summary");
+                summarySheet.Cells[1, 1].Value = "Operation Type";
+                summarySheet.Cells[1, 2].Value = isMoveOperation ? "Move" : "Copy";
+                summarySheet.Cells[2, 1].Value = "Total Files Processed";
+                summarySheet.Cells[2, 2].Value = successfulFiles.Count + failedFiles.Count;
+                summarySheet.Cells[3, 1].Value = "Successful Files";
+                summarySheet.Cells[3, 2].Value = successfulFiles.Count;
+                summarySheet.Cells[4, 1].Value = "Failed Files";
+                summarySheet.Cells[4, 2].Value = failedFiles.Count;
+                summarySheet.Cells[5, 1].Value = "Start Time";
+                summarySheet.Cells[5, 2].Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                summarySheet.Cells[6, 1].Value = "End Time";
+                summarySheet.Cells[6, 2].Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                // Successful files sheet
+                var successSheet = package.Workbook.Worksheets.Add("Successful Files");
+                successSheet.Cells[1, 1].Value = "File Path";
+                successSheet.Cells[1, 2].Value = "Size";
+                successSheet.Cells[1, 3].Value = "Size (Bytes)";
+
+                for (int i = 0; i < successfulFiles.Count; i++)
+                {
+                    successSheet.Cells[i + 2, 1].Value = successfulFiles[i];
+                    try
+                    {
+                        var fileInfo = new FileInfo(successfulFiles[i]);
+                        successSheet.Cells[i + 2, 2].Value = FormatSize(fileInfo.Length);
+                        successSheet.Cells[i + 2, 3].Value = fileInfo.Length;
+                    }
+                    catch
+                    {
+                        successSheet.Cells[i + 2, 2].Value = "N/A";
+                        successSheet.Cells[i + 2, 3].Value = "N/A";
+                    }
+                }
+
+                // Failed files sheet
+                if (failedFiles.Count > 0)
+                {
+                    var failSheet = package.Workbook.Worksheets.Add("Failed Files");
+                    failSheet.Cells[1, 1].Value = "File Path";
+                    failSheet.Cells[1, 2].Value = "Error";
+
+                    for (int i = 0; i < failedFiles.Count; i++)
+                    {
+                        failSheet.Cells[i + 2, 1].Value = failedFiles[i];
+                        // Error message would need to be tracked separately for each file
+                        failSheet.Cells[i + 2, 2].Value = "Error occurred during operation";
+                    }
+                }
+
+                package.SaveAs(new FileInfo(logPath));
             }
+
+            LogMessage($"\nLog saved to: {logPath}");
         }
 
-        private void UpdateOverallProgress(int value)
+        private void UpdateOverallProgress(int value, int remainingFiles)
         {
             if (progressBarOverall.InvokeRequired)
-                progressBarOverall.Invoke(new Action(() => progressBarOverall.Value = value));
+            {
+                progressBarOverall.Invoke(new Action(() =>
+                {
+                    progressBarOverall.Value = value;
+                    overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingFiles:N0}/{totalFiles:N0} files remaining)";
+                }));
+            }
             else
+            {
                 progressBarOverall.Value = value;
+                overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingFiles:N0}/{totalFiles:N0} files remaining)";
+            }
         }
 
         private void UpdateCurrentProgress(int value)
         {
             if (progressBarCurrent.InvokeRequired)
-                progressBarCurrent.Invoke(new Action(() => progressBarCurrent.Value = value));
+            {
+                progressBarCurrent.Invoke(new Action(() =>
+                {
+                    progressBarCurrent.Value = value;
+                    currentProgressbarLabel.Text = $"Current File Progress: {value}%";
+                }));
+            }
             else
+            {
                 progressBarCurrent.Value = value;
+                currentProgressbarLabel.Text = $"Current File Progress: {value}%";
+            }
         }
 
         private void LogMessage(string message)
