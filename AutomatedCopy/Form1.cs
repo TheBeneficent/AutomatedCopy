@@ -26,6 +26,7 @@ namespace AutomatedCopy
         private Label currentProgressbarLabel;
         private ProgressBar progressBarCurrent;
         private RichTextBox rtbLogs;
+        private CheckBox chkAutoScroll;
         private TreeView tvSourceTree;
         private Label lblFileCount;
         private Label lblFolderCount;
@@ -34,30 +35,37 @@ namespace AutomatedCopy
         private bool isPaused = false;
         private bool isStopped = false;
         private CancellationTokenSource cancellationTokenSource;
+        //private CancellationTokenSource _fileOperationCts;
+        //private CancellationTokenSource _scanCts;
+        private bool _isScanning = false;
 
         private List<string> successfulFiles = new List<string>();
         private List<string> failedFiles = new List<string>();
-        private long totalSizeBytes = 0;
+        //private long totalSizeBytes = 0;
         private long processedSizeBytes = 0;
-        private int totalFiles = 0;
+        //private int totalFiles = 0;
         private int processedFiles = 0;
-
+        private int totalOperations = 0;
+        private int completedOperations = 0;
+        private object progressLock = new object();
         private bool overwriteAll = false;
         private bool skipAll = false;
 
         public Form1()
         {
             InitializeComponent();
-            this.Text = "Automated Copy V4.0";
+            this.Text = "Automated Copy V4.1";
             this.Name = "Automated Copy";
             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
-            
+            //_fileOperationCts = new CancellationTokenSource();
+            //_scanCts = new CancellationTokenSource();
+
             InitializeControls();
         }
 
         private void InitializeControls()
         {
-            this.Size = new Size(900, 700);
+            this.Size = new Size(1000, 700);
 
             txtExcelPath = new TextBox
             {
@@ -157,7 +165,7 @@ namespace AutomatedCopy
             tvSourceTree = new TreeView
             {
                 Location = new Point(580, 10),
-                Size = new Size(300, 200),
+                Size = new Size(390, 200),
                 CheckBoxes = false
             };
             this.Controls.Add(tvSourceTree);
@@ -166,7 +174,7 @@ namespace AutomatedCopy
             lblFileCount = new Label
             {
                 Location = new Point(580, 220),
-                Size = new Size(300, 20),
+                Size = new Size(360, 20),
                 Text = "Total Files: 0"
             };
             this.Controls.Add(lblFileCount);
@@ -174,7 +182,7 @@ namespace AutomatedCopy
             lblFolderCount = new Label
             {
                 Location = new Point(580, 240),
-                Size = new Size(300, 20),
+                Size = new Size(360, 20),
                 Text = "Total Folders: 0"
             };
             this.Controls.Add(lblFolderCount);
@@ -182,7 +190,7 @@ namespace AutomatedCopy
             lblTotalSize = new Label
             {
                 Location = new Point(580, 260),
-                Size = new Size(300, 40),
+                Size = new Size(360, 40),
                 Text = "Total Size: 0 bytes (0 B)"
             };
             this.Controls.Add(lblTotalSize);
@@ -190,12 +198,25 @@ namespace AutomatedCopy
             rtbLogs = new RichTextBox
             {
                 Location = new Point(10, 210),
-                Size = new Size(870, 440),
+                Size = new Size(960, 440),
                 ReadOnly = true,
                 Font = new Font("Arial", 10, FontStyle.Bold),
                 WordWrap = true
             };
             this.Controls.Add(rtbLogs);
+
+            chkAutoScroll = new CheckBox
+            {
+                Text = "Auto-scroll logs",
+                Checked = true, // Enabled by default
+                Location = new Point(rtbLogs.Left, rtbLogs.Bottom - 25),
+                Width = 120,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+            };
+            this.Controls.Add(chkAutoScroll);
+
+            // Bring the checkbox to front so it's visible
+            chkAutoScroll.BringToFront();
         }
 
         private void BtnBrowse_Click(object sender, EventArgs e)
@@ -215,43 +236,68 @@ namespace AutomatedCopy
 
         private void LoadSourceTree(string excelFilePath)
         {
-            try
-            {
-                tvSourceTree.Nodes.Clear();
-                totalSizeBytes = 0;
-                totalFiles = 0;
-                int folderCount = 0;
+            // Set loading state immediately
+            lblFileCount.Text = "Total Files: Loading...";
+            lblFolderCount.Text = "Total Folders: Loading...";
+            lblTotalSize.Text = "Total Size: Loading...";
 
-                using (var package = new ExcelPackage(new FileInfo(excelFilePath)))
+            // Run the loading in a background task to keep UI responsive
+            Task.Run(() =>
+            {
+                try
                 {
-                    var worksheet = package.Workbook.Worksheets[0];
-                    int rowCount = worksheet.Dimension.Rows;
+                    tvSourceTree.Invoke(new Action(() => tvSourceTree.Nodes.Clear()));
 
-                    for (int row = 2; row <= rowCount; row++)
+                    long localTotalSize = 0;
+                    int localTotalFiles = 0;
+                    int localFolderCount = 0;
+
+                    using (var package = new ExcelPackage(new FileInfo(excelFilePath)))
                     {
-                        string sourcePath = worksheet.Cells[row, 1].Text.Trim();
+                        var worksheet = package.Workbook.Worksheets[0];
+                        int rowCount = worksheet.Dimension.Rows;
 
-                        if (string.IsNullOrEmpty(sourcePath) || !Directory.Exists(sourcePath))
-                            continue;
+                        for (int row = 2; row <= rowCount; row++)
+                        {
+                            string sourcePath = worksheet.Cells[row, 1].Text.Trim();
 
-                        var rootNode = new TreeNode(sourcePath);
-                        folderCount++;
-                        ProcessDirectoryForTree(sourcePath, rootNode, ref folderCount);
-                        tvSourceTree.Nodes.Add(rootNode);
+                            if (string.IsNullOrEmpty(sourcePath) || !Directory.Exists(sourcePath))
+                                continue;
+
+                            var rootNode = new TreeNode(sourcePath);
+                            localFolderCount++;
+
+                            // Process directory and update counts
+                            ProcessDirectoryForTree(sourcePath, rootNode, ref localFolderCount, ref localTotalFiles, ref localTotalSize);
+
+                            // Update tree view on UI thread
+                            tvSourceTree.Invoke(new Action(() => tvSourceTree.Nodes.Add(rootNode)));
+                        }
                     }
-                }
 
-                lblFileCount.Text = $"Total Files: {totalFiles:N0}";
-                lblFolderCount.Text = $"Total Folders: {folderCount:N0}";
-                lblTotalSize.Text = $"Total Size: {totalSizeBytes:N0} bytes ({FormatSize(totalSizeBytes)})";
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Error loading source tree: {ex.Message}");
-            }
+                    // Update UI with final values
+                    this.Invoke(new Action(() =>
+                    {
+                        lblFileCount.Text = $"Total Files: {localTotalFiles:N0}";
+                        lblFolderCount.Text = $"Total Folders: {localFolderCount:N0}";
+                        lblTotalSize.Text = $"Total Size: {localTotalSize:N0} bytes ({FormatSize(localTotalSize)})";
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    this.Invoke(new Action(() =>
+                    {
+                        MessageBox.Show($"Error loading source tree: {ex.Message}");
+                        lblFileCount.Text = "Total Files: Error";
+                        lblFolderCount.Text = "Total Folders: Error";
+                        lblTotalSize.Text = "Total Size: Error";
+                    }));
+                }
+            });
         }
 
-        private void ProcessDirectoryForTree(string path, TreeNode parentNode, ref int folderCount)
+        private void ProcessDirectoryForTree(string path, TreeNode parentNode,
+                                   ref int folderCount, ref int fileCount, ref long totalSize)
         {
             try
             {
@@ -264,8 +310,8 @@ namespace AutomatedCopy
                     try
                     {
                         var fileInfo = new FileInfo(file);
-                        totalSizeBytes += fileInfo.Length;
-                        totalFiles++;
+                        totalSize += fileInfo.Length;
+                        fileCount++;
                     }
                     catch { }
                 }
@@ -276,7 +322,7 @@ namespace AutomatedCopy
                     var dirNode = new TreeNode(Path.GetFileName(directory));
                     parentNode.Nodes.Add(dirNode);
                     folderCount++;
-                    ProcessDirectoryForTree(directory, dirNode, ref folderCount);
+                    ProcessDirectoryForTree(directory, dirNode, ref folderCount, ref fileCount, ref totalSize);
                 }
             }
             catch { }
@@ -378,6 +424,20 @@ namespace AutomatedCopy
                 var worksheet = package.Workbook.Worksheets[0];
                 int rowCount = worksheet.Dimension.Rows;
 
+                // First pass to count total operations (files + directories)
+                totalOperations = 0;
+                for (int row = 2; row <= rowCount; row++)
+                {
+                    string sourcePath = worksheet.Cells[row, 1].Text.Trim();
+                    if (!string.IsNullOrEmpty(sourcePath) && Directory.Exists(sourcePath))
+                    {
+                        totalOperations += CountFilesAndDirectories(sourcePath);
+                    }
+                }
+
+                completedOperations = 0;
+
+                // Second pass to actually process
                 for (int row = 2; row <= rowCount; row++)
                 {
                     if (cancellationToken.IsCancellationRequested)
@@ -403,8 +463,6 @@ namespace AutomatedCopy
                     LogMessage($"Processing Row {row}: Source='{sourcePath}', Target='{targetPath}'");
 
                     CopyOrMoveDirectory(sourcePath, targetPath, cancellationToken);
-
-                    UpdateOverallProgress((row - 1) * 100 / (rowCount - 1), rowCount - row);
                 }
             }
 
@@ -412,6 +470,24 @@ namespace AutomatedCopy
             {
                 LogSummary();
                 SaveLogToExcel();
+            }
+        }
+
+        // Helper method to count files and directories
+        private int CountFilesAndDirectories(string path)
+        {
+            try
+            {
+                int count = Directory.GetFiles(path).Length;
+                foreach (string dir in Directory.GetDirectories(path))
+                {
+                    count += CountFilesAndDirectories(dir);
+                }
+                return count + 1; // +1 for the directory itself
+            }
+            catch
+            {
+                return 1; // Count the directory even if we can't access its contents
             }
         }
 
@@ -484,6 +560,7 @@ namespace AutomatedCopy
                         if (File.Exists(destFile)) File.Delete(destFile);
                         File.Move(file, destFile);
                         LogMessage($"Moved: {fileName} to {targetDir}");
+                        successfulFiles.Add(destFile);
                     }
                     else
                     {
@@ -491,16 +568,32 @@ namespace AutomatedCopy
                         if (File.Exists(destFile)) File.Delete(destFile);
                         File.Copy(file, destFile);
                         LogMessage($"Copied: {fileName} to {targetDir}");
+                        successfulFiles.Add(destFile);
                     }
 
-                    successfulFiles.Add(destFile);
                     processedSizeBytes += fileSize;
                     processedFiles++;
+
+                    // Update progress after each file operation
+                    lock (progressLock)
+                    {
+                        completedOperations++;
+                        int progress = (int)((double)completedOperations / totalOperations * 100);
+                        UpdateOverallProgress(progress, totalOperations - completedOperations);
+                    }
                 }
                 catch (Exception ex)
                 {
                     LogMessage($"Failed: {fileName} - Error: {ex.Message}");
                     failedFiles.Add(file);
+
+                    // Still count failed operations in progress
+                    lock (progressLock)
+                    {
+                        completedOperations++;
+                        int progress = (int)((double)completedOperations / totalOperations * 100);
+                        UpdateOverallProgress(progress, totalOperations - completedOperations);
+                    }
                 }
 
                 UpdateCurrentProgress((i + 1) * 100 / files.Length);
@@ -513,6 +606,14 @@ namespace AutomatedCopy
 
                 string destSubDir = Path.Combine(targetDir, Path.GetFileName(subDir));
                 CopyOrMoveDirectory(subDir, destSubDir, cancellationToken);
+            }
+
+            // Count the directory itself when done
+            lock (progressLock)
+            {
+                completedOperations++;
+                int progress = (int)((double)completedOperations / totalOperations * 100);
+                UpdateOverallProgress(progress, totalOperations - completedOperations);
             }
 
             if (isMoveOperation && Directory.Exists(sourceDir) && Directory.GetFileSystemEntries(sourceDir).Length == 0)
@@ -672,20 +773,20 @@ namespace AutomatedCopy
             LogMessage($"\nLog saved to: {logPath}");
         }
 
-        private void UpdateOverallProgress(int value, int remainingFiles)
+        private void UpdateOverallProgress(int value, int remainingOperations)
         {
             if (progressBarOverall.InvokeRequired)
             {
                 progressBarOverall.Invoke(new Action(() =>
                 {
                     progressBarOverall.Value = value;
-                    overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingFiles:N0}/{totalFiles:N0} files remaining)";
+                    overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingOperations:N0}/{totalOperations:N0} operations remaining)";
                 }));
             }
             else
             {
                 progressBarOverall.Value = value;
-                overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingFiles:N0}/{totalFiles:N0} files remaining)";
+                overalProgressbarLabel.Text = $"Overall Progress: {value}% ({remainingOperations:N0}/{totalOperations:N0} operations remaining)";
             }
         }
 
@@ -709,9 +810,26 @@ namespace AutomatedCopy
         private void LogMessage(string message)
         {
             if (rtbLogs.InvokeRequired)
-                rtbLogs.Invoke(new Action(() => rtbLogs.AppendText(message + Environment.NewLine)));
+            {
+                rtbLogs.Invoke(new Action(() =>
+                {
+                    rtbLogs.AppendText(message + Environment.NewLine);
+                    if (chkAutoScroll.Checked)
+                    {
+                        rtbLogs.SelectionStart = rtbLogs.TextLength;
+                        rtbLogs.ScrollToCaret();
+                    }
+                }));
+            }
             else
+            {
                 rtbLogs.AppendText(message + Environment.NewLine);
+                if (chkAutoScroll.Checked)
+                {
+                    rtbLogs.SelectionStart = rtbLogs.TextLength;
+                    rtbLogs.ScrollToCaret();
+                }
+            }
         }
     }
 }
