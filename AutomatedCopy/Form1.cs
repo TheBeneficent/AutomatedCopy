@@ -241,7 +241,6 @@ namespace AutomatedCopy
             lblFolderCount.Text = "Total Folders: Loading...";
             lblTotalSize.Text = "Total Size: Loading...";
 
-            // Run the loading in a background task to keep UI responsive
             Task.Run(() =>
             {
                 try
@@ -260,18 +259,29 @@ namespace AutomatedCopy
                         for (int row = 2; row <= rowCount; row++)
                         {
                             string sourcePath = worksheet.Cells[row, 1].Text.Trim();
+                            if (string.IsNullOrEmpty(sourcePath)) continue;
 
-                            if (string.IsNullOrEmpty(sourcePath) || !Directory.Exists(sourcePath))
-                                continue;
-
-                            var rootNode = new TreeNode(sourcePath);
-                            localFolderCount++;
-
-                            // Process directory and update counts
-                            ProcessDirectoryForTree(sourcePath, rootNode, ref localFolderCount, ref localTotalFiles, ref localTotalSize);
-
-                            // Update tree view on UI thread
-                            tvSourceTree.Invoke(new Action(() => tvSourceTree.Nodes.Add(rootNode)));
+                            if (File.Exists(sourcePath))
+                            {
+                                // Add single file to tree
+                                var fileNode = new TreeNode(sourcePath);
+                                localTotalFiles++;
+                                try
+                                {
+                                    localTotalSize += new FileInfo(sourcePath).Length;
+                                }
+                                catch { }
+                                tvSourceTree.Invoke(new Action(() => tvSourceTree.Nodes.Add(fileNode)));
+                            }
+                            else if (Directory.Exists(sourcePath))
+                            {
+                                // Process directory
+                                var rootNode = new TreeNode(sourcePath);
+                                localFolderCount++;
+                                ProcessDirectoryForTree(sourcePath, rootNode,
+                                    ref localFolderCount, ref localTotalFiles, ref localTotalSize);
+                                tvSourceTree.Invoke(new Action(() => tvSourceTree.Nodes.Add(rootNode)));
+                            }
                         }
                     }
 
@@ -424,12 +434,23 @@ namespace AutomatedCopy
                 var worksheet = package.Workbook.Worksheets[0];
                 int rowCount = worksheet.Dimension.Rows;
 
-                // First pass to count total operations (files + directories)
+                // First pass to count total operations
                 totalOperations = 0;
                 for (int row = 2; row <= rowCount; row++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     string sourcePath = worksheet.Cells[row, 1].Text.Trim();
-                    if (!string.IsNullOrEmpty(sourcePath) && Directory.Exists(sourcePath))
+                    string targetPath = worksheet.Cells[row, 2].Text.Trim();
+
+                    if (string.IsNullOrEmpty(sourcePath) || string.IsNullOrEmpty(targetPath))
+                        continue;
+
+                    if (File.Exists(sourcePath))
+                    {
+                        totalOperations++; // Count individual files
+                    }
+                    else if (Directory.Exists(sourcePath))
                     {
                         totalOperations += CountFilesAndDirectories(sourcePath);
                     }
@@ -437,32 +458,34 @@ namespace AutomatedCopy
 
                 completedOperations = 0;
 
-                // Second pass to actually process
+                // Second pass to process
                 for (int row = 2; row <= rowCount; row++)
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                        break;
-
-                    while (isPaused && !cancellationToken.IsCancellationRequested)
-                    {
-                        Thread.Sleep(500);
-                    }
-
-                    if (cancellationToken.IsCancellationRequested)
-                        break;
+                    cancellationToken.ThrowIfCancellationRequested();
 
                     string sourcePath = worksheet.Cells[row, 1].Text.Trim();
                     string targetPath = worksheet.Cells[row, 2].Text.Trim();
 
                     if (string.IsNullOrEmpty(sourcePath) || string.IsNullOrEmpty(targetPath))
                     {
-                        LogMessage($"Row {row} skipped due to empty source or target path.");
+                        LogMessage($"Row {row} skipped: Empty source or target");
                         continue;
                     }
 
-                    LogMessage($"Processing Row {row}: Source='{sourcePath}', Target='{targetPath}'");
+                    LogMessage($"Processing Row {row}: {sourcePath} → {targetPath}");
 
-                    CopyOrMoveDirectory(sourcePath, targetPath, cancellationToken);
+                    if (File.Exists(sourcePath))
+                    {
+                        ProcessFile(sourcePath, targetPath, cancellationToken);
+                    }
+                    else if (Directory.Exists(sourcePath))
+                    {
+                        CopyOrMoveDirectory(sourcePath, targetPath, cancellationToken);
+                    }
+                    else
+                    {
+                        LogMessage($"Row {row} skipped: Source not found");
+                    }
                 }
             }
 
@@ -470,6 +493,86 @@ namespace AutomatedCopy
             {
                 LogSummary();
                 SaveLogToExcel();
+            }
+        }
+
+        private void ProcessFile(string sourceFile, string targetFile, CancellationToken cancellationToken)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // Ensure target directory exists
+                string targetDir = Path.GetDirectoryName(targetFile);
+                if (!Directory.Exists(targetDir))
+                {
+                    Directory.CreateDirectory(targetDir);
+                }
+
+                // Handle file conflicts
+                if (File.Exists(targetFile) && !overwriteAll && !skipAll)
+                {
+                    var result = ShowFileConflictDialog(Path.GetFileName(sourceFile));
+                    if (result == DialogResult.No) // Skip
+                    {
+                        LogMessage($"Skipped: {sourceFile} (user chose to skip)");
+                        return;
+                    }
+                    else if (result == DialogResult.Ignore) // Skip all
+                    {
+                        skipAll = true;
+                        LogMessage($"Skipped: {sourceFile} (skip all active)");
+                        return;
+                    }
+                    // Else continue with overwrite
+                }
+
+                if (File.Exists(targetFile) && skipAll)
+                {
+                    LogMessage($"Skipped: {sourceFile} (skip all active)");
+                    return;
+                }
+
+                // Perform the file operation
+                var fileInfo = new FileInfo(sourceFile);
+                long fileSize = fileInfo.Length;
+
+                if (isMoveOperation)
+                {
+                    if (File.Exists(targetFile)) File.Delete(targetFile);
+                    File.Move(sourceFile, targetFile);
+                    LogMessage($"Moved: {sourceFile} → {targetFile}");
+                }
+                else
+                {
+                    if (File.Exists(targetFile)) File.Delete(targetFile);
+                    File.Copy(sourceFile, targetFile);
+                    LogMessage($"Copied: {sourceFile} → {targetFile}");
+                }
+
+                successfulFiles.Add(targetFile);
+                processedSizeBytes += fileSize;
+
+                lock (progressLock)
+                {
+                    completedOperations++;
+                    int progress = (int)((double)completedOperations / totalOperations * 100);
+                    UpdateOverallProgress(progress, totalOperations - completedOperations);
+                }
+
+                UpdateCurrentProgress(100); // Single file operation is 100% complete
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Failed: {sourceFile} - Error: {ex.Message}");
+                failedFiles.Add(sourceFile);
+
+                lock (progressLock)
+                {
+                    completedOperations++;
+                    int progress = (int)((double)completedOperations / totalOperations * 100);
+                    UpdateOverallProgress(progress, totalOperations - completedOperations);
+                }
             }
         }
 
